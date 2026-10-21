@@ -38,6 +38,35 @@ Enable Opencode to authenticate against **Antigravity** (Google's IDE) via OAuth
 
 ## Installation
 
+### OpenCode V2
+
+Version **2.0.0** targets OpenCode **2.1.2 or newer**. V2 requires a new plugin implementation, plural
+configuration keys, and a `#variant` suffix on model references.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["opencode-antigravity-auth@latest"]
+}
+```
+
+Use this configuration once version 2.0.0 is published; PR checkouts can be
+built and loaded by absolute directory path. The plugin registers its models automatically. Connect **Google → Google OAuth
+(Antigravity)** with `opencode auth login`, then run:
+
+```bash
+opencode run --model=google/antigravity-gemini-3-flash#high "Hello"
+opencode run --model=google/antigravity-claude-opus-4-6-thinking#max "Hello"
+```
+
+Existing `antigravity-accounts.json` accounts are reused. Revoked refresh tokens
+still require a fresh Google sign-in. See [the V2 migration and verification
+guide](docs/OPENCODE-V2.md) for configuration examples, current Antigravity
+protocol changes, and the runtime regression test.
+
+The package also supports the V1 object plugin entrypoint in OpenCode
+**1.18.29+**. The instructions below use V1 configuration and command syntax.
+
 <details open>
 <summary><b>For Humans</b></summary>
 

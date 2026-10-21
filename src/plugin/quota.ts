@@ -1,6 +1,7 @@
 import {
+  ANTIGRAVITY_ENDPOINT,
   ANTIGRAVITY_ENDPOINT_PROD,
-  getAntigravityHeaders,
+  getAntigravityUserAgent,
   ANTIGRAVITY_PROVIDER_ID,
 } from "../constants";
 import { accessTokenExpired, formatRefreshParts, parseRefreshParts } from "./auth";
@@ -128,6 +129,9 @@ function aggregateQuota(models?: Record<string, FetchAvailableModelEntry>): Quot
 
   let totalCount = 0;
   for (const [modelName, entry] of Object.entries(models)) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
     const group = classifyQuotaGroup(modelName, entry.displayName ?? entry.modelName);
     if (!group) {
       continue;
@@ -186,8 +190,9 @@ async function fetchAvailableModels(
   accessToken: string,
   projectId: string,
 ): Promise<FetchAvailableModelsResponse> {
-  const endpoint = ANTIGRAVITY_ENDPOINT_PROD;
-  const quotaUserAgent = getAntigravityHeaders()["User-Agent"] || "antigravity/windows/amd64";
+  // Antigravity quota comes from the same host and Hub User-Agent as content requests.
+  const endpoint = ANTIGRAVITY_ENDPOINT;
+  const quotaUserAgent = getAntigravityUserAgent();
   const errors: string[] = [];
 
   const body = projectId ? { project: projectId } : {};

@@ -58,6 +58,8 @@ export function parseRateLimitReason(
   if (reason) {
     switch (reason.toUpperCase()) {
       case "QUOTA_EXHAUSTED": return "QUOTA_EXHAUSTED";
+      // AI credit (G1) balance exhausted: back off and rotate like other quota exhaustion
+      case "INSUFFICIENT_G1_CREDITS_BALANCE": return "QUOTA_EXHAUSTED";
       case "RATE_LIMIT_EXCEEDED": return "RATE_LIMIT_EXCEEDED";
       case "MODEL_CAPACITY_EXHAUSTED": return "MODEL_CAPACITY_EXHAUSTED";
     }
@@ -66,6 +68,11 @@ export function parseRateLimitReason(
   // 3. Message Text Scanning (Rust Regex parity)
   if (message) {
     const lower = message.toLowerCase();
+
+    // G1 credit exhaustion can arrive only inside the message text (e.g. a JSON error body)
+    if (lower.includes("insufficient_g1_credits_balance") || lower.includes("g1 credits balance")) {
+      return "QUOTA_EXHAUSTED";
+    }
     
     // Capacity / Overloaded (Transient) - Check FIRST before "exhausted"
     if (lower.includes("capacity") || lower.includes("overloaded") || lower.includes("resource exhausted")) {

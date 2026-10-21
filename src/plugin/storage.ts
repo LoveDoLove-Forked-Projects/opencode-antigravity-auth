@@ -433,12 +433,7 @@ function mergeAccountStorage(
     }
   }
 
-  return {
-    version: 4,
-    accounts: Array.from(accountMap.values()),
-    activeIndex: incoming.activeIndex,
-    activeIndexByFamily: incoming.activeIndexByFamily,
-  };
+  return normalizeAccountStorage(incoming, Array.from(accountMap.values()));
 }
 
 export function deduplicateAccountsByEmail<
@@ -504,6 +499,53 @@ export function deduplicateAccountsByEmail<
   }
 
   return result;
+}
+
+/** Preserve selected account identities when filtering, deduplicating, or merging. */
+function normalizeAccountStorage(
+  storage: AccountStorageV4,
+  candidateAccounts = storage.accounts,
+): AccountStorageV4 {
+  const accounts = deduplicateAccountsByEmail(
+    candidateAccounts.filter(
+      (account): account is AccountMetadataV3 =>
+        !!account &&
+        typeof account === "object" &&
+        typeof account.refreshToken === "string",
+    ),
+  );
+
+  const remapIndex = (index: unknown, fallback: number): number => {
+    const selected =
+      typeof index === "number" && Number.isInteger(index) && index >= 0
+        ? storage.accounts[index]
+        : undefined;
+    if (selected && typeof selected.refreshToken === "string") {
+      const tokenIndex = accounts.findIndex(
+        (account) => account.refreshToken === selected.refreshToken,
+      );
+      if (tokenIndex >= 0) return tokenIndex;
+
+      // A newer login for the same email may have replaced the selected token.
+      const emailIndex = selected.email
+        ? accounts.findIndex((account) => account.email === selected.email)
+        : -1;
+      if (emailIndex >= 0) return emailIndex;
+    }
+    return fallback;
+  };
+
+  const activeIndex = remapIndex(storage.activeIndex, 0);
+  const activeIndexByFamily = storage.activeIndexByFamily
+    ? { ...storage.activeIndexByFamily }
+    : undefined;
+  for (const family of ["claude", "gemini"] as const) {
+    if (activeIndexByFamily?.[family] !== undefined) {
+      activeIndexByFamily[family] = remapIndex(activeIndexByFamily[family], activeIndex);
+    }
+  }
+
+  return { version: 4, accounts, activeIndex, activeIndexByFamily };
 }
 
 function migrateV1ToV2(v1: AccountStorageV1): AccountStorage {
@@ -607,37 +649,13 @@ export async function loadAccounts(): Promise<AccountStorageV4 | null> {
       const v2 = migrateV1ToV2(data);
       const v3 = migrateV2ToV3(v2);
       storage = migrateV3ToV4(v3);
-      try {
-        await saveAccounts(storage);
-        log.info("Migration to v4 complete");
-      } catch (saveError) {
-        log.warn("Failed to persist migrated storage", {
-          error: String(saveError),
-        });
-      }
     } else if (data.version === 2) {
       log.info("Migrating account storage from v2 to v4");
       const v3 = migrateV2ToV3(data);
       storage = migrateV3ToV4(v3);
-      try {
-        await saveAccounts(storage);
-        log.info("Migration to v4 complete");
-      } catch (saveError) {
-        log.warn("Failed to persist migrated storage", {
-          error: String(saveError),
-        });
-      }
     } else if (data.version === 3) {
       log.info("Migrating account storage from v3 to v4");
       storage = migrateV3ToV4(data);
-      try {
-        await saveAccounts(storage);
-        log.info("Migration to v4 complete");
-      } catch (saveError) {
-        log.warn("Failed to persist migrated storage", {
-          error: String(saveError),
-        });
-      }
     } else if (data.version === 4) {
       storage = data;
     } else {
@@ -647,39 +665,19 @@ export async function loadAccounts(): Promise<AccountStorageV4 | null> {
       return null;
     }
 
-    // Validate accounts have required fields
-    const validAccounts = storage.accounts.filter(
-      (a): a is AccountMetadataV3 => {
-        return (
-          !!a &&
-          typeof a === "object" &&
-          typeof (a as AccountMetadataV3).refreshToken === "string"
-        );
-      },
-    );
-
-    // Deduplicate accounts by email (keeps newest entry for each email)
-    const deduplicatedAccounts = deduplicateAccountsByEmail(validAccounts);
-
-    // Clamp activeIndex to valid range after deduplication
-    let activeIndex =
-      typeof storage.activeIndex === "number" &&
-      Number.isFinite(storage.activeIndex)
-        ? storage.activeIndex
-        : 0;
-    if (deduplicatedAccounts.length > 0) {
-      activeIndex = Math.min(activeIndex, deduplicatedAccounts.length - 1);
-      activeIndex = Math.max(activeIndex, 0);
-    } else {
-      activeIndex = 0;
+    storage = normalizeAccountStorage(storage);
+    if (data.version !== 4) {
+      try {
+        await saveAccounts(storage);
+        log.info("Migration to v4 complete");
+      } catch (saveError) {
+        log.warn("Failed to persist migrated storage", {
+          error: String(saveError),
+        });
+      }
     }
 
-    return {
-      version: 4,
-      accounts: deduplicatedAccounts,
-      activeIndex,
-      activeIndexByFamily: storage.activeIndexByFamily,
-    };
+    return storage;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
@@ -698,7 +696,9 @@ export async function saveAccounts(storage: AccountStorageV4): Promise<void> {
 
   await withFileLock(path, async () => {
     const existing = await loadAccountsUnsafe();
-    const merged = existing ? mergeAccountStorage(existing, storage) : storage;
+    const merged = existing
+      ? mergeAccountStorage(existing, storage)
+      : normalizeAccountStorage(storage);
 
     const tempPath = `${path}.${randomBytes(6).toString("hex")}.tmp`;
     const content = JSON.stringify(merged, null, 2);
@@ -754,22 +754,21 @@ async function loadAccountsUnsafe(): Promise<AccountStorageV4 | null> {
     await ensureSecurePermissions(path);
 
     const content = await fs.readFile(path, "utf-8");
-    const parsed = JSON.parse(content);
+    const parsed = JSON.parse(content) as AnyAccountStorage;
+
+    if (!Array.isArray(parsed.accounts)) return null;
 
     if (parsed.version === 1) {
-      return migrateV3ToV4(migrateV2ToV3(migrateV1ToV2(parsed)));
+      return normalizeAccountStorage(migrateV3ToV4(migrateV2ToV3(migrateV1ToV2(parsed))));
     }
     if (parsed.version === 2) {
-      return migrateV3ToV4(migrateV2ToV3(parsed));
+      return normalizeAccountStorage(migrateV3ToV4(migrateV2ToV3(parsed)));
     }
     if (parsed.version === 3) {
-      return migrateV3ToV4(parsed);
+      return normalizeAccountStorage(migrateV3ToV4(parsed));
     }
 
-    return {
-      ...parsed,
-      accounts: deduplicateAccountsByEmail(parsed.accounts),
-    };
+    return parsed.version === 4 ? normalizeAccountStorage(parsed) : null;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {

@@ -1,9 +1,16 @@
 {
     "name": "opencode-antigravity-auth",
-    "version": "1.6.0",
+    "version": "2.0.0",
     "description": "Google Antigravity IDE OAuth auth plugin for Opencode - access Gemini 3 Pro and Claude 4.6 using Google credentials",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        },
+        "./package.json": "./package.json"
+    },
     "type": "module",
     "license": "MIT",
     "author": "noefabris",
@@ -29,12 +36,13 @@
         "node": ">=20.0.0"
     },
     "files": [
+        "index.js",
         "dist/",
         "README.md",
         "LICENSE"
     ],
     "scripts": {
-        "build": "tsc -p tsconfig.build.json",
+        "build": "tsc -p tsconfig.build.json && node script/fix-esm-imports.mjs",
         "build:schema": "npx tsx script/build-schema.ts",
         "typecheck": "tsc --noEmit",
         "test": "vitest run",
@@ -43,10 +51,8 @@
         "test:coverage": "vitest run --coverage",
         "prepublishOnly": "npm run build",
         "test:e2e:models": "npx tsx script/test-models.ts",
-        "test:e2e:regression": "npx tsx script/test-regression.ts"
-    },
-    "peerDependencies": {
-        "typescript": "^5"
+        "test:e2e:regression": "npx tsx script/test-regression.ts",
+        "test:e2e:v2": "node script/test-opencode-v2.mjs"
     },
     "devDependencies": {
         "@types/node": "^24.10.1",
@@ -58,6 +64,8 @@
         "zod-to-json-schema": "^3.25.1"
     },
     "dependencies": {
+        "@ai-sdk/google": "^3.0.137",
+        "@opencode/plugin": "^2.1.2",
         "@opencode-ai/plugin": "^0.15.30",
         "@openauthjs/openauth": "^0.4.3",
         "proper-lockfile": "^4.1.2",
