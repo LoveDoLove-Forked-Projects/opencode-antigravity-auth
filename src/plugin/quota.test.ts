@@ -9,8 +9,9 @@ vi.mock("./token", () => ({
   })),
 }))
 
-import { getAntigravityUserAgent } from "../constants.ts"
+import { GEMINI_CLI_HEADERS, getAntigravityUserAgent } from "../constants.ts"
 import { checkAccountsQuota } from "./quota.ts"
+import { refreshAccessToken } from "./token.ts"
 import type { AccountMetadataV3 } from "./storage.ts"
 import type { PluginClient } from "./types.ts"
 
@@ -31,6 +32,27 @@ afterEach(() => {
 })
 
 describe("checkAccountsQuota", () => {
+  it("persists OAuth rotation before catalog I/O starts", async () => {
+    vi.mocked(refreshAccessToken).mockResolvedValueOnce({ type: "oauth", refresh: "rotated||managed-project", access: "fresh", expires: Date.now() + 3600_000 })
+    let persisted = false
+    const save = vi.fn(async () => { persisted = true })
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      expect(persisted).toBe(true)
+      if (String(input).endsWith(":fetchAvailableModels")) return jsonResponse({ models: {} })
+      return jsonResponse({ buckets: [] })
+    }))
+    await checkAccountsQuota([account], {} as PluginClient, "google", { onAccountUpdated: save })
+    expect(save).toHaveBeenCalledWith(account, expect.objectContaining({ refreshToken: "rotated" }))
+  })
+
+  it("skips disabled accounts without refreshing their tokens when requested", async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal("fetch", fetchMock)
+    const results = await checkAccountsQuota([{ ...account, enabled: false }], {} as PluginClient, "google", { includeDisabled: false })
+    expect(results).toEqual([{ index: 0, email: account.email, status: "disabled", disabled: true }])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it("reads Antigravity quota from the daily host with the Hub User-Agent", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
       const url = String(input)
@@ -39,6 +61,8 @@ describe("checkAccountsQuota", () => {
           models: {
             "claude-opus-5-5-high": { quotaInfo: { remainingFraction: 0.5, resetTime: "2026-10-22T00:00:00Z" } },
             "gemini-3.8-flash-high": { quotaInfo: { remainingFraction: 0.25 } },
+            "gemini-4-argon-high": { maxTokens: 1048576, quotaInfo: { remainingFraction: 0.75 } },
+            "gemini-4-argon-disabled": { disabled: true, quotaInfo: { remainingFraction: 0 } },
             "malformed-entry": null,
           },
         })
@@ -55,6 +79,8 @@ describe("checkAccountsQuota", () => {
     expect(result?.status).toBe("ok")
     expect(result?.quota?.groups.claude?.remainingFraction).toBe(0.5)
     expect(result?.quota?.groups["gemini-flash"]?.remainingFraction).toBe(0.25)
+    expect(result?.quota?.groups["gemini-pro"]?.remainingFraction).toBe(0.75)
+    expect(result?.quota?.models?.["gemini-4-argon-high"]?.maxTokens).toBe(1048576)
 
     const modelsCalls = fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/v1internal:fetchAvailableModels"))
     expect(modelsCalls).toHaveLength(1)
@@ -66,5 +92,23 @@ describe("checkAccountsQuota", () => {
     // Gemini CLI quota buckets stay on production.
     const cliCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith("/v1internal:retrieveUserQuota"))
     expect(String(cliCall?.[0])).toBe("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota")
+    expect(new Headers(cliCall?.[1]?.headers).get("User-Agent")).toBe(GEMINI_CLI_HEADERS["User-Agent"])
+  })
+
+  it("shows current Gemini CLI model versions returned by Google", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith(":fetchAvailableModels")) return jsonResponse({ models: {} })
+      return jsonResponse({ buckets: [
+        { modelId: "gemini-3.8-flash-high", remainingFraction: 0.42, resetTime: "2026-10-22T00:00:00Z" },
+        { modelId: "gemini-3.5-flash-lite", remainingFraction: 0.8 },
+        { modelId: "gemini-4-pro", remainingFraction: 0.6 },
+        { modelId: "unrelated-model", remainingFraction: 1 },
+      ] })
+    }))
+    const [result] = await checkAccountsQuota([account], {} as PluginClient)
+    expect(result?.geminiCliQuota?.models.map(model => model.modelId)).toEqual([
+      "gemini-3.5-flash-lite", "gemini-3.8-flash-high", "gemini-4-pro",
+    ])
+    expect(result?.geminiCliQuota?.models[1]).toMatchObject({ remainingFraction: 0.42, resetTime: "2026-10-22T00:00:00Z" })
   })
 })

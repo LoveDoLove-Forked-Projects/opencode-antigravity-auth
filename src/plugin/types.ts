@@ -61,6 +61,8 @@ export interface PluginContext {
   runtimeVersion?: 1 | 2;
   /** Scoped outbound transport supplied by the V2 host wrapper. */
   fetch?: LoaderResult["fetch"];
+  /** V2's discovered per-account model eligibility; absent on legacy hosts. */
+  canUseAccount?: (account: { id?: string; refreshToken: string }, model: string) => boolean;
 }
 
 export type AuthPrompt =

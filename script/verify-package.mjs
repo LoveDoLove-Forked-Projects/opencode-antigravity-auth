@@ -44,7 +44,7 @@ try {
   mkdirSync(stage)
   mkdirSync(consumer)
   mkdirSync(cli)
-  for (const entry of ["src", "script", "index.ts", "index.js", "package.json", "tsconfig.json", "tsconfig.build.json", "README.md", "LICENSE"]) {
+  for (const entry of ["src", "script", "index.ts", "index.js", "tui.js", "package.json", "tsconfig.json", "tsconfig.build.json", "README.md", "LICENSE"]) {
     cpSync(join(root, entry), join(stage, entry), { recursive: true })
   }
   symlinkSync(realpathSync(join(root, "node_modules")), join(stage, "node_modules"), "dir")
@@ -52,7 +52,7 @@ try {
 
   const [packed] = JSON.parse(run("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", temporary], stage))
   const files = new Set(packed.files.map((file) => file.path))
-  for (const entry of ["index.js", "dist/index.js", "dist/index.d.ts"]) {
+  for (const entry of ["index.js", "tui.js", "dist/src/tui.js", "dist/index.js", "dist/index.d.ts"]) {
     assert(files.has(entry), `npm archive is missing ${entry}`)
   }
   assert(![...files].some((file) => file.startsWith("node_modules/") || file.startsWith("src/")), "npm archive contains development files")
@@ -70,6 +70,8 @@ try {
 import assert from "node:assert/strict"
 import plugin, { AntigravityCLIOAuthPlugin, GoogleOAuthPlugin } from ${JSON.stringify(packed.name)}
 import directoryPlugin from "./node_modules/${packed.name}/index.js"
+import tui from "${packed.name}/tui"
+assert.equal(typeof tui.setup, "function")
 assert.equal(typeof plugin.setup, "function")
 assert.equal(typeof plugin.server, "function")
 assert.equal(plugin.server, AntigravityCLIOAuthPlugin)

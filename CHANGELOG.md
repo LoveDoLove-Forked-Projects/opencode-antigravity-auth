@@ -1,6 +1,33 @@
 # Changelog
 
-## [2.0.0] - Unreleased
+## [2.1.0] - 2026-10-21
+
+### Added
+
+- Native `/antigravity` (`/ag`) menu for logged-in accounts, live quotas and reset
+  times, account selection, enable/disable, re-authentication, and deletion.
+- Account-specific models and token limits from Google's selectable inventory,
+  with a one-hour cache and manual refresh from the account menu.
+
+### Fixed
+
+- Retired and disabled model aliases no longer appear in the picker or fall
+  through to Google's native API-key transport.
+- Account changes invalidate cached models and safely stop stale refresh work.
+- In-flight refreshes and quota checks cannot undo account disabling or deletion.
+- Account IDs survive token rotation, and native account switching is respected.
+- Discovery preserves rotated credentials and routes models to accounts with access.
+- Routine quota checks skip disabled accounts and show readable per-account
+  results, including large saved-account pools.
+- Gemini CLI quotas include current model versions returned by Google.
+- Packaged TUI entrypoint and declarations work in a fresh production install.
+
+### Documentation
+
+- Replaced the README with minimal setup, usage, and account-menu instructions.
+- Recorded authenticated model, tool, quota, and menu checks on OpenCode 2.1.2.
+
+## [2.0.0] - 2026-10-21
 
 ### Added
 

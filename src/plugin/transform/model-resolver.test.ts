@@ -342,8 +342,8 @@ describe("advertised tier-suffix model IDs", () => {
     "gpt-oss-120b-medium",
   ];
 
-  it("lists exactly the verified advertised IDs", () => {
-    expect([...ADVERTISED_TIER_SUFFIX_MODEL_IDS].sort()).toEqual([...advertised].sort());
+  it("includes the known advertised IDs and current Flash tiers", () => {
+    expect([...ADVERTISED_TIER_SUFFIX_MODEL_IDS]).toEqual(expect.arrayContaining([...advertised, "gemini-3.8-flash-low", "gemini-3.8-flash-medium"]));
   });
 
   it.each(advertised)("keeps %s intact for antigravity routing", (modelId) => {

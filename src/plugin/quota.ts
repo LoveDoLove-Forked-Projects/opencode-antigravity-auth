@@ -2,6 +2,7 @@ import {
   ANTIGRAVITY_ENDPOINT,
   ANTIGRAVITY_ENDPOINT_PROD,
   getAntigravityUserAgent,
+  getRandomizedHeaders,
   ANTIGRAVITY_PROVIDER_ID,
 } from "../constants";
 import { accessTokenExpired, formatRefreshParts, parseRefreshParts } from "./auth";
@@ -25,6 +26,7 @@ export interface QuotaGroupSummary {
 export interface QuotaSummary {
   groups: Partial<Record<QuotaGroup, QuotaGroupSummary>>;
   modelCount: number;
+  models?: Record<string, AvailableModel>;
   error?: string;
 }
 
@@ -63,11 +65,23 @@ export interface AccountQuotaResult {
   updatedAccount?: AccountMetadataV3;
 }
 
-interface FetchAvailableModelsResponse {
+export interface FetchAvailableModelsResponse {
   models?: Record<string, FetchAvailableModelEntry>;
+  agentModelSorts?: Array<{ groups?: Array<{ modelIds?: string[] }> }>;
+  tieredModelIds?: Record<string, string[]>;
 }
 
-interface FetchAvailableModelEntry {
+export interface AvailableModel {
+  displayName?: string;
+  maxTokens?: number;
+  maxOutputTokens?: number;
+  supportsImages?: boolean;
+  supportsThinking?: boolean;
+  disabled?: boolean;
+  selectable?: boolean;
+}
+
+interface FetchAvailableModelEntry extends AvailableModel {
   quotaInfo?: {
     remainingFraction?: number;
     resetTime?: string;
@@ -113,16 +127,16 @@ function classifyQuotaGroup(modelName: string, displayName?: string): QuotaGroup
   if (combined.includes("claude")) {
     return "claude";
   }
-  const isGemini3 = combined.includes("gemini-3") || combined.includes("gemini 3");
-  if (!isGemini3) {
+  if (!combined.includes("gemini")) {
     return null;
   }
   const family = getModelFamily(modelName);
   return family === "gemini-flash" ? "gemini-flash" : "gemini-pro";
 }
 
-function aggregateQuota(models?: Record<string, FetchAvailableModelEntry>): QuotaSummary {
+function aggregateQuota(models?: Record<string, FetchAvailableModelEntry>, selectable?: Set<string>): QuotaSummary {
   const groups: Partial<Record<QuotaGroup, QuotaGroupSummary>> = {};
+  const catalog: Record<string, AvailableModel> = {};
   if (!models) {
     return { groups, modelCount: 0 };
   }
@@ -132,6 +146,17 @@ function aggregateQuota(models?: Record<string, FetchAvailableModelEntry>): Quot
     if (!entry || typeof entry !== "object") {
       continue;
     }
+    // Keep only catalog metadata. API experiments can contain unrelated prompts.
+    catalog[modelName] = {
+      displayName: entry.displayName,
+      maxTokens: entry.maxTokens,
+      maxOutputTokens: entry.maxOutputTokens,
+      supportsImages: entry.supportsImages,
+      supportsThinking: entry.supportsThinking,
+      disabled: entry.disabled,
+      selectable: selectable ? selectable.has(modelName) : undefined,
+    };
+    if (entry.disabled) continue;
     const group = classifyQuotaGroup(modelName, entry.displayName ?? entry.modelName);
     if (!group) {
       continue;
@@ -173,7 +198,7 @@ function aggregateQuota(models?: Record<string, FetchAvailableModelEntry>): Quot
     };
   }
 
-  return { groups, modelCount: totalCount };
+  return { groups, modelCount: totalCount, models: catalog };
 }
 
 async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = FETCH_TIMEOUT_MS): Promise<Response> {
@@ -224,20 +249,15 @@ async function fetchGeminiCliQuota(
   projectId: string,
 ): Promise<RetrieveUserQuotaResponse> {
   const endpoint = ANTIGRAVITY_ENDPOINT_PROD;
-  // Use Gemini CLI user-agent to get CLI quota buckets (not Antigravity buckets)
-  const platform = process.platform || "darwin";
-  const arch = process.arch || "arm64";
-  const geminiCliUserAgent = `GeminiCLI/1.0.0/gemini-2.5-pro (${platform}; ${arch})`;
-
   const body = projectId ? { project: projectId } : {};
   
   try {
     const response = await fetchWithTimeout(`${endpoint}/v1internal:retrieveUserQuota`, {
       method: "POST",
       headers: {
+        ...getRandomizedHeaders("gemini-cli"),
         Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
-        "User-Agent": geminiCliUserAgent,
       },
       body: JSON.stringify(body),
     });
@@ -267,14 +287,9 @@ function aggregateGeminiCliQuota(response: RetrieveUserQuotaResponse): GeminiCli
       continue;
     }
     
-    // Filter out models we don't care about for Gemini CLI quotas
-    // Only show gemini-3-* and gemini-2.5-pro models (the premium ones)
+    // Keep the model versions returned by Google instead of a dated allowlist.
     const modelId = bucket.modelId;
-    const isRelevantModel = 
-      modelId.startsWith("gemini-3-") || 
-      modelId === "gemini-2.5-pro";
-    
-    if (!isRelevantModel) {
+    if (!modelId.startsWith("gemini-")) {
       continue;
     }
     
@@ -316,6 +331,11 @@ export async function checkAccountsQuota(
   accounts: AccountMetadataV3[],
   client: PluginClient,
   providerId = ANTIGRAVITY_PROVIDER_ID,
+  options: {
+    includeDisabled?: boolean;
+    onAccountUpdated?: (original: AccountMetadataV3, updated: AccountMetadataV3) => Promise<unknown>;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<AccountQuotaResult[]> {
   const results: AccountQuotaResult[] = [];
   
@@ -323,10 +343,16 @@ export async function checkAccountsQuota(
 
   for (const [index, account] of accounts.entries()) {
     const disabled = account.enabled === false;
+    if (disabled && options.includeDisabled !== true) {
+      results.push({ index, email: account.email, status: "disabled", disabled: true });
+      continue;
+    }
 
     let auth = buildAuthFromAccount(account);
+    let updatedAccount: AccountMetadataV3 | undefined;
 
     try {
+      options.signal?.throwIfAborted();
       if (accessTokenExpired(auth)) {
         const refreshed = await refreshAccessToken(auth, client, providerId);
         if (!refreshed) {
@@ -335,9 +361,16 @@ export async function checkAccountsQuota(
         auth = refreshed;
       }
 
+      updatedAccount = applyAccountUpdates(account, auth);
+      if (updatedAccount) await options.onAccountUpdated?.(account, updatedAccount);
+      options.signal?.throwIfAborted();
+      const beforeProject = updatedAccount ?? account;
       const projectContext = await ensureProjectContext(auth);
       auth = projectContext.auth;
-      const updatedAccount = applyAccountUpdates(account, auth);
+      updatedAccount = applyAccountUpdates(account, auth);
+      const projectUpdates = applyAccountUpdates(beforeProject, auth);
+      if (projectUpdates) await options.onAccountUpdated?.(beforeProject, projectUpdates);
+      options.signal?.throwIfAborted();
 
       let quotaResult: QuotaSummary;
       let geminiCliQuotaResult: GeminiCliQuotaSummary;
@@ -357,7 +390,11 @@ export async function checkAccountsQuota(
           error: "Failed to fetch Antigravity quota",
         };
       } else {
-        quotaResult = aggregateQuota(antigravityResponse.models);
+        const visible = (antigravityResponse.agentModelSorts ?? []).flatMap(sort => (sort.groups ?? []).flatMap(group => group.modelIds ?? []));
+        // The backend also exposes obsolete aliases, completion models, and
+        // routing IDs. Prefer the same selectable inventory as Antigravity.
+        const selectable = visible.length ? new Set([...visible, ...Object.values(antigravityResponse.tieredModelIds ?? {}).flat()]) : undefined;
+        quotaResult = aggregateQuota(antigravityResponse.models, selectable);
       }
 
       // Process Gemini CLI quota
@@ -388,6 +425,7 @@ export async function checkAccountsQuota(
         index,
         email: account.email,
         status: "error",
+        updatedAccount,
         disabled,
         error: error instanceof Error ? error.message : String(error),
       });

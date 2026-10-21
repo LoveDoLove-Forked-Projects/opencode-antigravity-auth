@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AccountManager, type ModelFamily, type HeaderStyle, parseRateLimitReason, calculateBackoffMs, type RateLimitReason, resolveQuotaGroup } from "./accounts";
-import type { AccountStorageV4 } from "./storage";
+import { saveAccounts, type AccountStorageV4 } from "./storage";
 import type { OAuthAuthDetails } from "./types";
 
 // Mock storage to prevent test data from leaking to real config files
@@ -18,6 +18,44 @@ describe("AccountManager", () => {
   beforeEach(() => {
     vi.useRealTimers();
     vi.stubGlobal("process", { ...process, pid: 0 });
+  });
+
+  it("drains an active save and prevents stale requests from writing after retirement", async () => {
+    const save = vi.mocked(saveAccounts);
+    save.mockClear();
+    let finish: () => void = () => { throw new Error("Save did not start"); };
+    save.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+    const manager = new AccountManager(undefined, { version: 4, activeIndex: 0, accounts: [{ id: "stable", refreshToken: "old", addedAt: 1, lastUsed: 1 }] });
+    const saving = manager.saveToDisk();
+    let retired = false;
+    const retiring = manager.retire().then(() => { retired = true; });
+    await Promise.resolve();
+    expect(retired).toBe(false);
+    finish();
+    await Promise.all([saving, retiring]);
+    const account = manager.getAccounts()[0]!;
+    manager.updateFromAuth(account, { type: "oauth", refresh: "rotated", access: "new", expires: Date.now() + 3600000 });
+    await manager.saveToDisk();
+    manager.requestSaveToDisk();
+    expect(save).toHaveBeenCalledOnce();
+    expect(save.mock.calls[0]?.[0].accounts[0]?.id).toBe("stable");
+  });
+
+  it("ignores an older OAuth response after a different refresh has already updated the account", () => {
+    const manager = new AccountManager(undefined, { version: 4, activeIndex: 0, accounts: [{ refreshToken: "old", addedAt: 1, lastUsed: 1 }] });
+    const account = manager.getAccounts()[0]!;
+    manager.updateFromAuth(account, { type: "oauth", refresh: "current", access: "current-access" }, "old");
+    manager.updateFromAuth(account, { type: "oauth", refresh: "obsolete", access: "obsolete-access" }, "old");
+    expect(account.parts.refreshToken).toBe("current");
+    expect(account.access).toBe("current-access");
+  });
+
+  it.each(["sticky", "round-robin", "hybrid"] as const)("routes %s selection only to accounts advertising the requested model", strategy => {
+    const manager = new AccountManager(undefined, { version: 4, activeIndex: 0, accounts: [
+      { refreshToken: "ineligible", addedAt: 1, lastUsed: 1 },
+      { refreshToken: "eligible", addedAt: 1, lastUsed: 1 },
+    ] });
+    expect(manager.getCurrentOrNextForFamily("gemini", "gemini-3.8-flash-high", strategy, "antigravity", false, 100, 600000, account => account.parts.refreshToken === "eligible")?.parts.refreshToken).toBe("eligible");
   });
 
   it("treats on-disk storage as source of truth, even when empty", () => {

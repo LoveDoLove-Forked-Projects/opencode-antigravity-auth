@@ -64,13 +64,21 @@ export const MODEL_ALIASES: Record<string, string> = {
  * tier-like suffix. The suffix is part of the real model ID, so it must reach the
  * API unchanged instead of being stripped as a legacy thinking-tier alias.
  */
-export const ADVERTISED_TIER_SUFFIX_MODEL_IDS: ReadonlySet<string> = new Set([
+const advertisedModelIds = new Set([
   "claude-opus-5-5-high",
   "claude-sonnet-5-5-high",
   "gemini-4-argon-high",
   "gemini-3.8-flash-high",
+  "gemini-3.8-flash-medium",
+  "gemini-3.8-flash-low",
   "gpt-oss-120b-medium",
 ]);
+export const ADVERTISED_TIER_SUFFIX_MODEL_IDS: ReadonlySet<string> = advertisedModelIds;
+
+/** Preserve backend IDs discovered from Google's account-specific catalog. */
+export function registerAdvertisedModelIds(ids: Iterable<string>): void {
+  for (const id of ids) advertisedModelIds.add(id.toLowerCase());
+}
 
 const TIER_REGEX = /-(minimal|low|medium|high)$/;
 const QUOTA_PREFIX_REGEX = /^antigravity-/i;

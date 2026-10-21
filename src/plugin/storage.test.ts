@@ -4,6 +4,9 @@ import {
   migrateV2ToV3,
   loadAccounts,
   saveAccounts,
+  matchesAccountToken,
+  updateAccountCredentials,
+  type AccountMetadataV3,
   type AccountMetadata,
   type AccountStorage,
   type AccountStorageV4,
@@ -22,6 +25,18 @@ vi.mock("proper-lockfile", () => ({
     lock: vi.fn().mockResolvedValue(vi.fn().mockResolvedValue(undefined)),
   },
 }));
+
+describe("native connection identity", () => {
+  it("recognizes original and intermediate native credentials after repeated rotation without email", () => {
+    const account: AccountMetadataV3 = { id: "persistent-id", refreshToken: "first-token", addedAt: 1, lastUsed: 1, enabled: false };
+    updateAccountCredentials(account, { refreshToken: "second-token" });
+    updateAccountCredentials(account, { refreshToken: "third-token", managedProjectId: "resolved-project" });
+    for (const token of ["first-token", "second-token", "third-token"]) expect(matchesAccountToken(account, token)).toBe(true);
+    expect(matchesAccountToken(account, "unrelated-token")).toBe(false);
+    expect(account).toMatchObject({ id: "persistent-id", enabled: false, refreshToken: "third-token", managedProjectId: "resolved-project" });
+    expect(JSON.stringify(account.refreshTokenHashes)).not.toContain("token");
+  });
+});
 
 describe("deduplicateAccountsByEmail", () => {
   it("returns empty array for empty input", () => {
@@ -434,6 +449,14 @@ describe("Account selection normalization", () => {
     expect(saved.accounts.map((a) => a.refreshToken)).toEqual(["a", "b", "c"]);
     expect(saved.activeIndex).toBe(1);
     expect(saved.activeIndexByFamily).toEqual({ claude: 0, gemini: 2 });
+  });
+
+  it("replaces a rotated token by stable identity even when usage timestamps are equal", async () => {
+    const original = { ...account("old-token", "same@example.com"), id: "stable-id" };
+    mockStorage({ version: 4, accounts: [original], activeIndex: 0 });
+    await saveAccounts({ version: 4, accounts: [{ ...original, refreshToken: "rotated-token" }], activeIndex: 0 });
+    expect(savedStorage().accounts).toHaveLength(1);
+    expect(savedStorage().accounts[0]).toMatchObject({ ...original, refreshToken: "rotated-token" });
   });
 
   it("remaps to the retained email winner when merge removes the selected token", async () => {

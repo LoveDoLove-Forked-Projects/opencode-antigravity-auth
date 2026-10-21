@@ -81,6 +81,7 @@ export default {
         return Response.json({ cloudaicompanionProject: "fixture-project", currentTier: { id: "standard-tier" } })
       }
       if (url.pathname.endsWith(":fetchAvailableModels")) return Response.json({ models: {} })
+      if (url.pathname.endsWith(":retrieveUserQuota")) return Response.json({ buckets: [] })
       if (!url.pathname.endsWith(":streamGenerateContent")) throw new Error(`Unexpected Google request: ${url.pathname}`)
       if (!provedEffective) {
         await credentialProof("credential-effective")
