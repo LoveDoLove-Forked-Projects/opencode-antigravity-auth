@@ -10,8 +10,13 @@ permissions:
   contents: write
   id-token: write
 
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
+
 jobs:
   publish:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -28,15 +33,15 @@ jobs:
 
       - name: Determine release state
         id: determine
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           CURRENT_VERSION=$(node -p "require('./package.json').version")
           echo "current_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
 
-          # Abort if version contains beta/alpha/rc (prerelease identifiers)
-          if echo "$CURRENT_VERSION" | grep -qE '(beta|alpha|rc)'; then
-            echo "ERROR: Cannot publish prerelease version '$CURRENT_VERSION' as official release" >&2
-            echo "This is main branch - version should not contain beta/alpha/rc" >&2
+          if ! [[ "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Cannot publish '$CURRENT_VERSION' as a stable release" >&2
             exit 1
           fi
           if git rev-parse HEAD^ >/dev/null 2>&1; then
@@ -46,44 +51,104 @@ jobs:
             PREVIOUS_VERSION=""
           fi
           echo "previous_version=$PREVIOUS_VERSION" >> "$GITHUB_OUTPUT"
-          if [ "$CURRENT_VERSION" = "$PREVIOUS_VERSION" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+          git fetch origin --tags
+          TAG_EXISTS=false
+          if git show-ref --verify --quiet "refs/tags/v$CURRENT_VERSION"; then
+            TAG_EXISTS=true
           fi
-          git fetch --tags --force
-          if git tag -l "v$CURRENT_VERSION" | grep -q "v$CURRENT_VERSION"; then
-            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+          echo "tag_exists=$TAG_EXISTS" >> "$GITHUB_OUTPUT"
+
+          # Only a registry 404 means the version is unpublished. Auth/network
+          # errors must fail the job, rather than accidentally permit a publish.
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          echo "package_name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+          NPM_BODY=$(mktemp)
+          NPM_STATUS=$(curl --silent --show-error --retry 3 --connect-timeout 10 --max-time 30 \
+            --output "$NPM_BODY" --write-out '%{http_code}' \
+            "https://registry.npmjs.org/$PACKAGE_NAME/$CURRENT_VERSION")
+          case "$NPM_STATUS" in
+            200)
+              node -e 'const fs = require("node:fs"); const p = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); if (p.name !== process.argv[2] || p.version !== process.argv[3]) process.exit(1)' \
+                "$NPM_BODY" "$PACKAGE_NAME" "$CURRENT_VERSION"
+              NPM_EXISTS=true ;;
+            404) NPM_EXISTS=false ;;
+            *) echo "ERROR: npm registry lookup failed (HTTP $NPM_STATUS)" >&2; exit 1 ;;
+          esac
+
+          RELEASE_BODY=$(mktemp)
+          RELEASE_STATUS=$(curl --silent --show-error --retry 3 --connect-timeout 10 --max-time 30 \
+            --header "Authorization: Bearer $GH_TOKEN" --header 'Accept: application/vnd.github+json' \
+            --output "$RELEASE_BODY" --write-out '%{http_code}' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/v$CURRENT_VERSION")
+          case "$RELEASE_STATUS" in
+            200)
+              node -e 'const fs = require("node:fs"); const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); if (r.tag_name !== process.argv[2] || r.draft !== false) process.exit(1)' \
+                "$RELEASE_BODY" "v$CURRENT_VERSION"
+              RELEASE_EXISTS=true ;;
+            404) RELEASE_EXISTS=false ;;
+            *) echo "ERROR: GitHub release lookup failed (HTTP $RELEASE_STATUS)" >&2; exit 1 ;;
+          esac
+
+          ELIGIBLE=false
+          if [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ] || [ "$TAG_EXISTS" = true ] || [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            ELIGIBLE=true
           fi
+          NEEDS_PUBLISH=false
+          NEEDS_RELEASE=false
+          if [ "$ELIGIBLE" = true ]; then
+            [ "$NPM_EXISTS" = true ] || NEEDS_PUBLISH=true
+            [ "$RELEASE_EXISTS" = true ] || NEEDS_RELEASE=true
+            if [ "$TAG_EXISTS" = false ] && { [ "$NPM_EXISTS" = true ] || [ "$RELEASE_EXISTS" = true ]; }; then
+              echo "ERROR: Release exists without its source tag; refusing to recreate it" >&2
+              exit 1
+            fi
+          fi
+          echo "needs_publish=$NEEDS_PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "needs_release=$NEEDS_RELEASE" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release v$CURRENT_VERSION"
+            echo "- npm version exists: $NPM_EXISTS"
+            echo "- Git tag exists: $TAG_EXISTS"
+            echo "- GitHub release exists: $RELEASE_EXISTS"
+            echo "- Publish needed: $NEEDS_PUBLISH"
+            echo "- GitHub release needed: $NEEDS_RELEASE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore tagged release source
+        if: steps.determine.outputs.tag_exists == 'true' && (steps.determine.outputs.needs_publish == 'true' || steps.determine.outputs.needs_release == 'true')
+        env:
+          CURRENT_VERSION: ${{ steps.determine.outputs.current_version }}
+          PACKAGE_NAME: ${{ steps.determine.outputs.package_name }}
+        run: |
+          set -euo pipefail
+          git checkout --detach "refs/tags/v$CURRENT_VERSION"
+          node -e 'const p = require("./package.json"); if (p.name !== process.env.PACKAGE_NAME || p.version !== process.env.CURRENT_VERSION) throw new Error("Release tag package name/version does not match")'
+          echo "Building existing tag v$CURRENT_VERSION at $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify NPM token
-        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
+        if: steps.determine.outputs.needs_publish == 'true'
         run: |
-          if [ -z "${NPM_TOKEN}" ]; then
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
             echo "NPM_TOKEN secret is required" >&2
             exit 1
           fi
+          npm whoami --registry https://registry.npmjs.org
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Install dependencies
-        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
-        run: npm install
+        if: steps.determine.outputs.needs_publish == 'true'
+        run: npm ci
 
       - name: Run Tests
-        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
+        if: steps.determine.outputs.needs_publish == 'true'
         run: npm test
 
       - name: Update README and Tag
-        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
+        if: steps.determine.outputs.needs_publish == 'true' && steps.determine.outputs.tag_exists == 'false'
         id: update_readme
         run: |
           CURRENT_VERSION="${{ steps.determine.outputs.current_version }}"
-          
-          git checkout main
-          git pull origin main
           
           # Update version in README.md (looking for pattern opencode-antigravity-auth@x.y.z)
           sed -i "s/opencode-antigravity-auth@[0-9]\+\.[0-9]\+\.[0-9]\+/opencode-antigravity-auth@$CURRENT_VERSION/g" README.md
@@ -104,19 +169,38 @@ jobs:
           git push origin "v$CURRENT_VERSION"
 
       - name: Build
-        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
+        if: steps.determine.outputs.needs_publish == 'true'
         run: npm run build
 
       - name: Verify build artifacts
-        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
+        if: steps.determine.outputs.needs_publish == 'true'
         run: |
           set -euo pipefail
           [ -f dist/index.js ] || { echo "dist/index.js missing" >&2; exit 1; }
           [ -f dist/index.d.ts ] || { echo "dist/index.d.ts missing" >&2; exit 1; }
           [ -d dist/src ] || { echo "dist/src/ missing" >&2; exit 1; }
 
+      - name: Publish to npm
+        if: steps.determine.outputs.needs_publish == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          CURRENT_VERSION: ${{ steps.determine.outputs.current_version }}
+          PACKAGE_NAME: ${{ steps.determine.outputs.package_name }}
+        run: |
+          set -euo pipefail
+          SOURCE_COMMIT=$(git rev-parse HEAD)
+          test "$SOURCE_COMMIT" = "$(git rev-parse "refs/tags/v$CURRENT_VERSION^{commit}")"
+          git diff --exit-code --quiet HEAD
+          # npm reads these variables, not the checkout, for provenance source
+          # metadata. Keep the workflow/run identity intact while naming the
+          # actual source tag and commit built above.
+          GITHUB_SHA="$SOURCE_COMMIT" GITHUB_REF="refs/tags/v$CURRENT_VERSION" \
+            npm publish --access public --provenance
+          npm view "$PACKAGE_NAME@$CURRENT_VERSION" version --registry https://registry.npmjs.org --prefer-online
+          echo "Published $PACKAGE_NAME@$CURRENT_VERSION to npm" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Generate release notes
-        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
+        if: steps.determine.outputs.needs_release == 'true'
         id: release_notes
         run: |
           set -euo pipefail
@@ -175,7 +259,7 @@ jobs:
           } >>"$GITHUB_OUTPUT"
 
       - name: Create GitHub release
-        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
+        if: steps.determine.outputs.needs_release == 'true'
         uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -184,9 +268,3 @@ jobs:
           release_name: v${{ steps.determine.outputs.current_version }}
           body: ${{ steps.release_notes.outputs.body }}
           generate_release_notes: false
-
-      - name: Publish to npm
-        if: steps.determine.outputs.changed == 'true' && steps.determine.outputs.tag_exists == 'false'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --provenance
