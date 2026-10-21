@@ -1,5 +1,28 @@
 # Changelog
 
+## [2.0.0] - Unreleased
+
+### Added
+
+- OpenCode V2.1.2 plugin registration, Google OAuth integration, automatic model
+  registration, thinking variants, and the Google Search tool.
+- A V2 CLI regression harness covering Gemini and Claude streaming and tool
+  round trips in isolated temporary directories.
+- V2 plugin configuration and runtime model registration, with native Google
+  models left intact and a V1.18.29+ server entrypoint retained.
+
+### Breaking
+
+- OpenCode V1 hosts older than 1.18.29 must upgrade before loading this release.
+
+### Fixed
+
+- Current Antigravity Hub version discovery, request identity, consumer endpoint,
+  project metadata, and removal of SDK API keys from OAuth requests.
+- Published ESM imports include explicit file extensions.
+- V2 plugin cleanup stops refresh resources and avoids V1 session-file recovery.
+- Account selection survives duplicate sign-ins and merging of saved account pools.
+
 ## [1.6.0] - 2026-02-20
 
 ### Fixed

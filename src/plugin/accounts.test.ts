@@ -1183,6 +1183,25 @@ describe("AccountManager", () => {
         expect(parseRateLimitReason("quota_exhausted", undefined)).toBe("QUOTA_EXHAUSTED");
       });
 
+      it("classifies INSUFFICIENT_G1_CREDITS_BALANCE as QUOTA_EXHAUSTED", () => {
+        expect(parseRateLimitReason("INSUFFICIENT_G1_CREDITS_BALANCE", undefined, 429)).toBe("QUOTA_EXHAUSTED");
+        expect(parseRateLimitReason("insufficient_g1_credits_balance", "Resource exhausted", 429)).toBe("QUOTA_EXHAUSTED");
+      });
+
+      it("detects INSUFFICIENT_G1_CREDITS_BALANCE inside the error message", () => {
+        expect(
+          parseRateLimitReason(
+            undefined,
+            '{"reason":"INSUFFICIENT_G1_CREDITS_BALANCE","message":"Resource has been exhausted (e.g. check quota)."}',
+            429,
+          ),
+        ).toBe("QUOTA_EXHAUSTED");
+        // Must win over the transient capacity wording that may share the message
+        expect(
+          parseRateLimitReason(undefined, "INSUFFICIENT_G1_CREDITS_BALANCE: no capacity left on this plan", 429),
+        ).toBe("QUOTA_EXHAUSTED");
+      });
+
       it("parses RATE_LIMIT_EXCEEDED from reason field", () => {
         expect(parseRateLimitReason("RATE_LIMIT_EXCEEDED", undefined)).toBe("RATE_LIMIT_EXCEEDED");
       });
