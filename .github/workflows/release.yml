@@ -55,6 +55,7 @@ jobs:
           TAG_EXISTS=false
           if git show-ref --verify --quiet "refs/tags/v$CURRENT_VERSION"; then
             TAG_EXISTS=true
+            echo "tag_commit=$(git rev-parse "refs/tags/v$CURRENT_VERSION^{commit}")" >> "$GITHUB_OUTPUT"
           fi
           echo "tag_exists=$TAG_EXISTS" >> "$GITHUB_OUTPUT"
 
@@ -114,16 +115,14 @@ jobs:
             echo "- GitHub release needed: $NEEDS_RELEASE"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Restore tagged release source
-        if: steps.determine.outputs.tag_exists == 'true' && (steps.determine.outputs.needs_publish == 'true' || steps.determine.outputs.needs_release == 'true')
-        env:
-          CURRENT_VERSION: ${{ steps.determine.outputs.current_version }}
-          PACKAGE_NAME: ${{ steps.determine.outputs.package_name }}
+      - name: Verify workflow source
+        if: steps.determine.outputs.needs_publish == 'true'
         run: |
           set -euo pipefail
-          git checkout --detach "refs/tags/v$CURRENT_VERSION"
-          node -e 'const p = require("./package.json"); if (p.name !== process.env.PACKAGE_NAME || p.version !== process.env.CURRENT_VERSION) throw new Error("Release tag package name/version does not match")'
-          echo "Building existing tag v$CURRENT_VERSION at $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          # npm verifies provenance against the immutable GitHub OIDC identity.
+          # Build that commit and never override GITHUB_SHA or GITHUB_REF.
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code --quiet HEAD
 
       - name: Verify NPM token
         if: steps.determine.outputs.needs_publish == 'true'
@@ -144,33 +143,11 @@ jobs:
         if: steps.determine.outputs.needs_publish == 'true'
         run: npm test
 
-      - name: Update README and Tag
-        if: steps.determine.outputs.needs_publish == 'true' && steps.determine.outputs.tag_exists == 'false'
-        id: update_readme
-        run: |
-          CURRENT_VERSION="${{ steps.determine.outputs.current_version }}"
-          
-          # Update version in README.md (looking for pattern opencode-antigravity-auth@x.y.z)
-          sed -i "s/opencode-antigravity-auth@[0-9]\+\.[0-9]\+\.[0-9]\+/opencode-antigravity-auth@$CURRENT_VERSION/g" README.md
-          
-          if ! git diff --quiet README.md; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add README.md
-            git commit -m "docs: update readme version to $CURRENT_VERSION [skip ci]"
-            git push origin main
-            echo "README updated"
-          else
-            echo "README already up to date"
-          fi
-          
-          # Create and push tag on the current HEAD
-          git tag "v$CURRENT_VERSION"
-          git push origin "v$CURRENT_VERSION"
-
       - name: Build
         if: steps.determine.outputs.needs_publish == 'true'
-        run: npm run build
+        run: |
+          rm -rf -- dist
+          npm run build
 
       - name: Verify build artifacts
         if: steps.determine.outputs.needs_publish == 'true'
@@ -180,22 +157,79 @@ jobs:
           [ -f dist/index.d.ts ] || { echo "dist/index.d.ts missing" >&2; exit 1; }
           [ -d dist/src ] || { echo "dist/src/ missing" >&2; exit 1; }
 
+      - name: Pack release
+        if: steps.determine.outputs.needs_publish == 'true'
+        id: package
+        env:
+          CURRENT_VERSION: ${{ steps.determine.outputs.current_version }}
+          PACKAGE_NAME: ${{ steps.determine.outputs.package_name }}
+        run: |
+          set -euo pipefail
+          PACKAGE_DIR=$(mktemp -d)
+          npm pack --ignore-scripts --json --pack-destination "$PACKAGE_DIR" > "$PACKAGE_DIR/pack.json"
+          TARBALL=$(node -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))[0].filename' "$PACKAGE_DIR/pack.json")
+          tar -xOf "$PACKAGE_DIR/$TARBALL" package/package.json | node -e '
+            const fs = require("node:fs")
+            const p = JSON.parse(fs.readFileSync(0, "utf8"))
+            const repository = "git+https://github.com/" + process.env.GITHUB_REPOSITORY + ".git"
+            if (p.name !== process.env.PACKAGE_NAME || p.version !== process.env.CURRENT_VERSION || p.repository?.url !== repository) {
+              throw new Error("Packed name/version/repository does not match release")
+            }
+          '
+          echo "tarball=$PACKAGE_DIR/$TARBALL" >> "$GITHUB_OUTPUT"
+
+      - name: Verify package matches existing tag
+        if: steps.determine.outputs.needs_publish == 'true' && steps.determine.outputs.tag_exists == 'true'
+        env:
+          CURRENT_VERSION: ${{ steps.determine.outputs.current_version }}
+          PACKAGE_NAME: ${{ steps.determine.outputs.package_name }}
+          PACKED_TARBALL: ${{ steps.package.outputs.tarball }}
+          REFERENCE_COMMIT: ${{ steps.determine.outputs.tag_commit }}
+        run: |
+          set -euo pipefail
+          REFERENCE_DIR=$(mktemp -d)
+          mkdir "$REFERENCE_DIR/source"
+          git archive "$REFERENCE_COMMIT" | tar -x -C "$REFERENCE_DIR/source"
+          (
+            cd "$REFERENCE_DIR/source"
+            node -e 'const p = require("./package.json"); if (p.name !== process.env.PACKAGE_NAME || p.version !== process.env.CURRENT_VERSION) throw new Error("Release tag package name/version does not match")'
+            npm ci
+            rm -rf -- dist
+            npm run build
+            npm pack --ignore-scripts --json --pack-destination "$REFERENCE_DIR" > "$REFERENCE_DIR/pack.json"
+          )
+          REFERENCE_TARBALL=$(node -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))[0].filename' "$REFERENCE_DIR/pack.json")
+          if ! cmp --silent "$PACKED_TARBALL" "$REFERENCE_DIR/$REFERENCE_TARBALL"; then
+            echo "ERROR: Package differs from existing tag; bump the version instead of replacing its contents" >&2
+            exit 1
+          fi
+          {
+            echo "Package at $GITHUB_SHA is byte-identical to v$CURRENT_VERSION ($REFERENCE_COMMIT)"
+            echo "SHA-512: $(sha512sum "$PACKED_TARBALL" | cut -d ' ' -f 1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create source tag
+        if: steps.determine.outputs.needs_publish == 'true' && steps.determine.outputs.tag_exists == 'false'
+        env:
+          CURRENT_VERSION: ${{ steps.determine.outputs.current_version }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git tag "v$CURRENT_VERSION"
+          git push origin "v$CURRENT_VERSION"
+
       - name: Publish to npm
         if: steps.determine.outputs.needs_publish == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           CURRENT_VERSION: ${{ steps.determine.outputs.current_version }}
           PACKAGE_NAME: ${{ steps.determine.outputs.package_name }}
+          PACKED_TARBALL: ${{ steps.package.outputs.tarball }}
         run: |
           set -euo pipefail
-          SOURCE_COMMIT=$(git rev-parse HEAD)
-          test "$SOURCE_COMMIT" = "$(git rev-parse "refs/tags/v$CURRENT_VERSION^{commit}")"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git diff --exit-code --quiet HEAD
-          # npm reads these variables, not the checkout, for provenance source
-          # metadata. Keep the workflow/run identity intact while naming the
-          # actual source tag and commit built above.
-          GITHUB_SHA="$SOURCE_COMMIT" GITHUB_REF="refs/tags/v$CURRENT_VERSION" \
-            npm publish --access public --provenance
+          npm publish "$PACKED_TARBALL" --access public --provenance
           npm view "$PACKAGE_NAME@$CURRENT_VERSION" version --registry https://registry.npmjs.org --prefer-online
           echo "Published $PACKAGE_NAME@$CURRENT_VERSION to npm" >> "$GITHUB_STEP_SUMMARY"
 
@@ -206,20 +240,21 @@ jobs:
           set -euo pipefail
           CURRENT_VERSION="${{ steps.determine.outputs.current_version }}"
           PREVIOUS_VERSION="${{ steps.determine.outputs.previous_version }}"
+          RELEASE_COMMIT=$(git rev-parse "refs/tags/v$CURRENT_VERSION^{commit}")
           RANGE=""
           COMPARE_URL=""
-          LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+          LAST_TAG=$(git describe --tags --abbrev=0 "$RELEASE_COMMIT^" 2>/dev/null || true)
           if [ -z "$LAST_TAG" ] && [ -n "$PREVIOUS_VERSION" ] && git rev-parse "refs/tags/v${PREVIOUS_VERSION}" >/dev/null 2>&1; then
             LAST_TAG="v${PREVIOUS_VERSION}"
           fi
           if [ -n "$LAST_TAG" ]; then
-            RANGE="${LAST_TAG}..HEAD"
+            RANGE="${LAST_TAG}..${RELEASE_COMMIT}"
             COMPARE_URL="https://github.com/${GITHUB_REPOSITORY}/compare/${LAST_TAG}...v${CURRENT_VERSION}"
           fi
           if [ -n "$RANGE" ]; then
             CHANGELOG=$(git log --no-merges --pretty=format:'- %s (%h)' "$RANGE")
           else
-            CHANGELOG=$(git log --no-merges --pretty=format:'- %s (%h)')
+            CHANGELOG=$(git log --no-merges --pretty=format:'- %s (%h)' "$RELEASE_COMMIT")
           fi
           if [ -z "$CHANGELOG" ]; then
             CHANGELOG="- No commits found for this release."
