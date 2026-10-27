@@ -22,6 +22,23 @@ export async function loadManagedAccounts() {
   return storage
 }
 
+/** Pair the lowest usable cached fraction with its own reset time. */
+function summarizeCachedQuota(account: AccountMetadataV3): AccountSummary["quota"] {
+  let quota: AccountSummary["quota"]
+  for (const group of Object.values(account.cachedQuota ?? {})) {
+    if (!group || typeof group !== "object") continue
+    const remainingFraction = group.remainingFraction
+    if (remainingFraction === undefined || !Number.isFinite(remainingFraction) || remainingFraction < 0 || remainingFraction > 1) continue
+    if (!quota || remainingFraction < quota.remainingFraction) {
+      // Older multi-model caches only record the earliest reset in the group,
+      // which may belong to a model with a different remaining fraction.
+      const resetTime = group.remainingFractionResetTime ?? (group.modelCount === 1 ? group.resetTime : undefined)
+      quota = { remainingFraction, resetTime: typeof resetTime === "string" ? resetTime : undefined, updatedAt: account.cachedQuotaUpdatedAt }
+    }
+  }
+  return quota
+}
+
 export async function registerAccountManagement(
   ctx: Plugin.Context,
   client: PluginClient,
@@ -39,6 +56,7 @@ export async function registerAccountManagement(
       id: accountID(account), email: account.email ?? `Account ${index + 1}`,
       enabled: account.enabled !== false, current: index === storage.activeIndex,
       verificationRequired: account.verificationRequired === true, lastUsed: account.lastUsed ?? 0,
+      quota: summarizeCachedQuota(account),
     }))
   }
 
